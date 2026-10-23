@@ -24,8 +24,8 @@ FIELD_KEYS = {
     "brand items": "items", "items": "items",
     "booked for": "events", "booked": "events", "event": "events", "events": "events",
     "paid amount": "paid", "paid": "paid", "amount": "paid",
-    "offered discount": "discount", "offered discount %": "discount",
-    "discount": "discount",
+    # discount lines are still recognised (so they cause no warning) but are ignored
+    "offered discount": "ignored", "offered discount %": "ignored", "discount": "ignored",
     "booking date": "date", "date": "date",
     "contact": "contact", "phone": "contact", "contact number": "contact",
     "payment method": "method", "payment mode": "method", "payment type": "method",
@@ -89,19 +89,6 @@ def parse_amount(text: str):
     mult = {"k": 1_000, "lac": 100_000, "lakh": 100_000, "lacs": 100_000, "lakhs": 100_000}
     val *= mult.get(m.group(2), 1)
     return int(val) if val == int(val) else round(val, 2)
-
-
-def parse_discount(text: str):
-    t = re.sub(r"(%|percent|percentage)", "", text.lower()).strip()
-    if not t:
-        return 0
-    try:
-        val = float(t)
-    except ValueError:
-        raise ValueError(f"Could not read discount from '{text}'")
-    if not 0 <= val <= 100:
-        raise ValueError(f"Discount {val}% must be between 0 and 100")
-    return int(val) if val == int(val) else val
 
 
 def parse_date(text: str) -> date:
@@ -182,14 +169,6 @@ def parse_text(raw: str):
         except ValueError as e:
             errors.append(str(e))
             data[key] = None
-
-    if fields.get("discount", "").strip() == "":
-        warnings.append("Offered Discount % was empty - treated as 0%.")
-    try:
-        data["discount"] = parse_discount(fields.get("discount", ""))
-    except ValueError as e:
-        errors.append(str(e))
-        data["discount"] = 0
 
     data["method"] = parse_method(fields.get("method", ""))
     if fields.get("method", "").strip() and data["method"] is None:

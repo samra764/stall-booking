@@ -1,7 +1,8 @@
 import hmac
 import io
 import json
-import uuid
+import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,10 +30,12 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
 
 HEADERS = ["Booking ID", "Saved At", "Name", "Brand Name", "Brand Items",
            "Booked For (All Events)", "This Event", "Paid Amount (This Event)",
-           "Total Paid (Whole Booking)", "Discount %", "Booking Date",
-           "Contact", "Logo", "Payment Receipt", "Payment Method", "Received By"]
-OLD_HEADERS = HEADERS[:14]   # first version of the sheet (before payment method existed)
-COL_BRAND, COL_CONTACT, COL_PAID = 3, 11, 7   # 0-based positions used below
+           "Total Paid (Whole Booking)", "Booking Date",
+           "Contact", "Logo", "Payment Receipt", "Payment Method", "Received By",
+           "Other IDs of This Booking"]
+LAST_COL = "P"      # 16 columns: A..P
+EVENT_CODES = {"Jacranda": "JAC", "AMBLEM": "AMB", "Qawali Night": "QWL"}
+COL_BRAND, COL_CONTACT = HEADERS.index("Brand Name"), HEADERS.index("Contact")   # 0-based
 
 
 def secrets_get(key, default=None):
@@ -97,15 +100,22 @@ def ensure_event_sheets(sh):
             ws = sh.add_worksheet(title=ev, rows=1000, cols=len(HEADERS))
             ws.append_row(HEADERS, value_input_option="RAW")
             ws.freeze(rows=1)
-            ws.format("A1:P1", {"textFormat": {"bold": True},
+            ws.format(f"A1:{LAST_COL}1", {"textFormat": {"bold": True},
                                 "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}})
         else:
             ws = existing[ev]
             first = ws.row_values(1)
-            if first == OLD_HEADERS:                       # upgrade older tab: add 2 columns at the end
-                if ws.col_count < len(HEADERS):
+            # the discount column was removed: delete it from older tabs (only when every
+            # other heading is exactly what we expect, so nothing unknown is ever deleted)
+            if "Discount %" in first:
+                without = [h for h in first if h != "Discount %"]
+                if without == HEADERS[:len(without)]:
+                    ws.delete_columns(first.index("Discount %") + 1)
+                    first = ws.row_values(1)
+            if first != HEADERS and first and first == HEADERS[:len(first)] and len(first) >= 13:
+                if ws.col_count < len(HEADERS):             # older tab: add the newer columns at the end
                     ws.add_cols(len(HEADERS) - ws.col_count)
-                ws.update(range_name="A1:P1", values=[HEADERS])
+                ws.update(range_name=f"A1:{LAST_COL}1", values=[HEADERS])
             elif first != HEADERS:
                 if not any(ws.get_all_values()):          # empty tab -> write headers
                     ws.append_row(HEADERS, value_input_option="RAW")
@@ -115,6 +125,24 @@ def ensure_event_sheets(sh):
                         "Rename or delete that tab so the app can create it correctly.")
         sheets[ev] = ws
     return sheets
+
+
+@st.cache_resource
+def save_lock():
+    """One lock shared by everyone using the app, so two people saving at the same
+    moment can never be given the same booking ID."""
+    return threading.Lock()
+
+
+def next_booking_id(ws, event):
+    """JAC-001, JAC-002 ... : one more than the highest number already in that event's tab."""
+    code = EVENT_CODES[event]
+    top = 0
+    for v in ws.col_values(1)[1:]:
+        m = re.fullmatch(rf"{code}-(\d+)", v.strip())
+        if m:
+            top = max(top, int(m.group(1)))
+    return f"{code}-{top + 1:03d}"
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -186,7 +214,7 @@ def save_uploads(booking_id, logo, receipt):
 # ----------------------------------------------------------------------------
 def defaults():
     return {"f_name": "", "f_brand": "", "f_items": "", "f_events": [],
-            "f_paid": 0.0, "f_discount": 0.0,
+            "f_paid": 0.0,
             "f_date": datetime.now(TZ).date(), "f_contact": "",
             "f_method": None, "f_received": "",
             "parse_errors": [], "parse_warnings": [], "parsed": False}
@@ -206,7 +234,6 @@ def do_parse():
     st.session_state.f_items = data["items"]
     st.session_state.f_events = data["events"]
     st.session_state.f_paid = float(data["paid"] or 0)
-    st.session_state.f_discount = float(data["discount"] or 0)
     if data["date"]:
         st.session_state.f_date = data["date"]
     st.session_state.f_contact = data["contact"]
@@ -289,18 +316,20 @@ st.sidebar.success(f"Connected: {sh.title}")
 # Main UI
 # ----------------------------------------------------------------------------
 st.title("🧾 Stall Booking Records")
-tab_new, tab_view = st.tabs(["➕ New booking", "📊 Records"])
+tab_new, tab_view, tab_search = st.tabs(["➕ New booking", "📊 Records", "🔎 Search"])
 
 with tab_new:
     st.subheader("Step 1 - Paste the booking details")
     st.text_area("Booking text", key="raw_text", height=230,
                  placeholder="Name:\nBrand Name:\nBrand Items:\nBooked for: Jacranda, AMBLEM, qawali night\n"
-                             "Paid Amount:\nOffered Discount %:\nBooking date:\nContact:")
+                             "Paid Amount:\nBooking date:\nContact:")
     st.button("🔍 Read details", on_click=do_parse, type="primary",
               disabled=not st.session_state.raw_text.strip())
 
     if st.session_state.last_saved:
-        st.success(st.session_state.last_saved)
+        st.success(st.session_state.last_saved["msg"])
+        st.caption("Copy this message to send to the stall owner:")
+        st.code(st.session_state.last_saved["copy"], language=None)
 
     if st.session_state.parsed:
         st.subheader("Step 2 - Check what the app understood")
@@ -320,8 +349,6 @@ with tab_new:
         with c2:
             st.number_input("Paid Amount (PKR, whole booking)", min_value=0.0,
                             step=500.0, key="f_paid")
-            st.number_input("Offered Discount %", min_value=0.0, max_value=100.0,
-                            step=1.0, key="f_discount")
             st.date_input("Booking date", key="f_date", format="DD/MM/YYYY")
             st.text_input("Contact", key="f_contact")
 
@@ -416,40 +443,49 @@ with tab_new:
             st.info("Fix these first:\n\n" + "\n".join(f"- {p}" for p in problems))
         if st.button("✅ Save booking to Google Sheets", type="primary",
                      disabled=bool(problems) or not allow_dupe):
-            booking_id = f"BK{datetime.now(TZ):%y%m%d-%H%M%S}-{uuid.uuid4().hex[:3].upper()}"
             now = datetime.now(TZ).strftime("%d-%b-%Y %H:%M")
+            brand_clean = st.session_state.f_brand.strip()
             with st.spinner("Saving..."):
-                try:
-                    logo_ref, receipt_ref, drive_warn = save_uploads(booking_id, logo, receipt)
-                    if receipt is None and method == "Cash":
-                        receipt_ref = "Cash - no receipt photo"
-                except Exception as e:  # noqa
-                    st.error(f"Nothing was saved. {e}")
-                    st.stop()
-                saved_to = []
-                try:
-                    for ev in events:
-                        row = [booking_id, now, st.session_state.f_name.strip(),
-                               st.session_state.f_brand.strip(), st.session_state.f_items.strip(),
-                               ", ".join(events), ev, amounts[ev], paid,
-                               st.session_state.f_discount,
-                               st.session_state.f_date.strftime("%d-%b-%Y"),
-                               st.session_state.f_contact.strip(),
-                               logo_ref, receipt_ref, method,
-                               st.session_state.f_received.strip() if method == "Cash" else ""]
-                        sheets[ev].append_row(row, value_input_option="RAW")
-                        saved_to.append(ev)
-                except Exception as e:  # noqa
-                    st.error(f"Saved to {', '.join(saved_to) or 'nothing'} but then failed on the next "
-                             f"sheet: {e}. Booking ID {booking_id}. Add the missing row manually "
-                             "or fix the error and save again after deleting the partial row.")
-                    st.stop()
-            if drive_warn:
-                st.warning(drive_warn)
-            msg = (f"Saved {st.session_state.f_brand.strip()} "
-                   f"to {', '.join(saved_to)} (ID {booking_id}).")
+                with save_lock():          # only one booking is saved at a time
+                    try:
+                        ids = {ev: next_booking_id(sheets[ev], ev) for ev in events}
+                    except Exception as e:  # noqa
+                        st.error(f"Nothing was saved. Could not read the sheet: {e}")
+                        st.stop()
+                    tag = "_".join(ids.values())
+                    try:
+                        logo_ref, receipt_ref, drive_warn = save_uploads(tag, logo, receipt)
+                        if receipt is None and method == "Cash":
+                            receipt_ref = "Cash - no receipt photo"
+                    except Exception as e:  # noqa
+                        st.error(f"Nothing was saved. {e}")
+                        st.stop()
+                    saved_to = []
+                    try:
+                        for ev in events:
+                            others = ", ".join(f"{ids[e]} ({e})" for e in events if e != ev)
+                            row = [ids[ev], now, st.session_state.f_name.strip(),
+                                   brand_clean, st.session_state.f_items.strip(),
+                                   ", ".join(events), ev, amounts[ev], paid,
+                                   st.session_state.f_date.strftime("%d-%b-%Y"),
+                                   st.session_state.f_contact.strip(),
+                                   logo_ref, receipt_ref, method,
+                                   st.session_state.f_received.strip() if method == "Cash" else "",
+                                   others]
+                            sheets[ev].append_row(row, value_input_option="RAW")
+                            saved_to.append(ev)
+                    except Exception as e:  # noqa
+                        st.error(f"Saved to {', '.join(saved_to) or 'nothing'} but then failed on the next "
+                                 f"sheet: {e}. IDs used: {', '.join(ids.values())}. Add the missing row "
+                                 "manually or delete the partial row and save again.")
+                        st.stop()
+            ids_text = ", ".join(f"{ids[e]} ({e})" for e in events)
+            msg = f"Saved {brand_clean}. Booking ID(s): {ids_text}"
+            copy_text = (f"Booking confirmed - {brand_clean}\n"
+                         f"Booking ID(s): {ids_text}\n"
+                         "Please keep this ID for any future contact.")
             st.cache_data.clear()
-            st.session_state.last_saved = msg
+            st.session_state.last_saved = {"msg": msg, "copy": copy_text}
             st.session_state.do_reset_now = True
             st.rerun()
 
@@ -471,3 +507,99 @@ with tab_view:
             m1.metric("Stalls booked", len(df))
             m2.metric("Total collected (Rs)", f"{paid_col.sum():,.0f}")
             st.dataframe(df, hide_index=True)
+
+
+# ----------------------------------------------------------------------------
+# Search tab
+# ----------------------------------------------------------------------------
+def digits_of(text):
+    return re.sub(r"\D", "", text or "")
+
+
+def load_all_rows():
+    rows = []
+    for ev in EVENTS:
+        vals = read_all(sheets[ev], ev)
+        if len(vals) <= 1:
+            continue
+        head = vals[0]
+        for r in vals[1:]:
+            r = r + [""] * (len(head) - len(r))
+            d = dict(zip(head, r))
+            d["_event"] = ev
+            rows.append(d)
+    return rows
+
+
+def stall_key(d):
+    return digits_of(d.get("Contact", "")) or d.get("Brand Name", "").strip().casefold()
+
+
+def row_matches(d, q):
+    ql = q.strip().casefold()
+    short_num = q.strip().isdigit() and len(q.strip()) <= 4      # e.g. "14"
+    if not short_num and ql in d.get("Booking ID", "").casefold():
+        return True
+    if ql in d.get("Brand Name", "").casefold() or ql in d.get("Name", "").casefold():
+        return True
+    qd = digits_of(q)
+    if len(qd) >= 4 and qd in digits_of(d.get("Contact", "")):
+        return True
+    if short_num:                                           # "14" finds JAC-014, AMB-014 ...
+        m = re.search(r"-(\d+)$", d.get("Booking ID", ""))
+        if m and int(m.group(1)) == int(q.strip()):
+            return True
+    return False
+
+
+with tab_search:
+    st.subheader("Find a stall")
+    q = st.text_input("Search by booking ID, brand name, person name or phone number",
+                      key="search_q", placeholder="e.g. JAC-014, zara, 0300-1234567")
+    if st.button("🔄 Refresh data", key="refresh_search"):
+        st.cache_data.clear()
+        st.rerun()
+    if not q.strip():
+        st.caption("Type part of a brand or person name, a phone number, or an ID such as JAC-014 "
+                   "(or just 14). All three events are searched together.")
+    else:
+        all_rows = load_all_rows()
+        groups = {}
+        for d in all_rows:
+            groups.setdefault(stall_key(d), []).append(d)
+        hits = [g for g in groups.values() if any(row_matches(d, q) for d in g)]
+        if not hits:
+            st.info("No booking found. Check the spelling, or try just part of the name or the last digits "
+                    "of the phone number.")
+        else:
+            st.caption(f"{len(hits)} stall(s) found" + (" - showing the first 20" if len(hits) > 20 else ""))
+        for g in hits[:20]:
+            first = g[0]
+            st.markdown(f"### {first.get('Brand Name', '')}")
+            st.caption(f"{first.get('Name', '')}  ·  {first.get('Contact', '')}  ·  "
+                       f"Items: {first.get('Brand Items', '')}")
+            cols = {"Booking ID": "Booking ID", "_event": "Event",
+                    "Paid Amount (This Event)": "Paid (Rs)",
+                    "Booking Date": "Booking date", "Payment Method": "Payment method",
+                    "Received By": "Cash received by"}
+            df = pd.DataFrame([{new: d.get(old, "") for old, new in cols.items()} for d in g])
+            st.dataframe(df, hide_index=True)
+            def _num(x):
+                try:
+                    return float(str(x).replace(",", ""))
+                except ValueError:
+                    return 0.0
+            total = sum(_num(d.get("Paid Amount (This Event)", "")) for d in g)
+            st.metric("Total paid (all events)", f"Rs {total:,.0f}")
+            for label in ("Logo", "Payment Receipt"):
+                seen = []
+                for d in g:
+                    ref = d.get(label, "").strip()
+                    if ref and ref not in seen:
+                        seen.append(ref)
+                for ref in seen:
+                    if ref.startswith("http"):
+                        st.link_button(f"Open {label.lower()}", ref)
+                    else:
+                        st.caption(f"{label}: {ref}")
+            st.divider()
