@@ -2,6 +2,7 @@ import hmac
 import io
 import json
 import re
+import textwrap
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials
 
@@ -36,6 +38,89 @@ HEADERS = ["Booking ID", "Saved At", "Name", "Brand Name", "Brand Items",
 LAST_COL = "P"      # 16 columns: A..P
 EVENT_CODES = {"Jacranda": "JAC", "AMBLEM": "AMB", "Qawali Night": "QWL"}
 COL_BRAND, COL_CONTACT = HEADERS.index("Brand Name"), HEADERS.index("Contact")   # 0-based
+
+
+# ----------------------------------------------------------------------------
+# Booking receipt (picture + text to send to the stall owner)
+# ----------------------------------------------------------------------------
+EXPO_TITLE = "Be Pakistani, Buy Pakistani 2026"   # shown at the top of the receipt - change if needed
+
+
+def _font(size, bold=False):
+    names = ["DejaVuSans-Bold.ttf", "arialbd.ttf"] if bold else ["DejaVuSans.ttf", "arial.ttf"]
+    for n in names:
+        try:
+            return ImageFont.truetype(n, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def fmt_rs(x):
+    x = float(x)
+    return f"Rs {x:,.0f}" if x.is_integer() else f"Rs {x:,.2f}"
+
+
+def receipt_rows(brand, booked_by, events, ids, amounts, paid, method, received_by, booking_date):
+    """Each row: (label, [lines shown on the picture], single-line text for copy/paste)."""
+    rows = [("Stall", [brand], brand),
+            ("Stall booked by", [booked_by], booked_by),
+            ("Booking ID(s)", [f"{ids[e]} ({e})" for e in events],
+             ", ".join(f"{ids[e]} ({e})" for e in events))]
+    if paid > 0:
+        lines = [fmt_rs(paid)]
+        text = fmt_rs(paid)
+        if len(events) > 1:
+            lines += [f"{e}: {fmt_rs(amounts[e])}" for e in events]
+            text += " (" + ", ".join(f"{e} {fmt_rs(amounts[e])}" for e in events) + ")"
+    else:
+        lines, text = ["Rs 0 (no payment yet)"], "Rs 0 (no payment yet)"
+    rows += [("Paid amount", lines, text), ("Payment method", [method], method)]
+    if received_by:
+        rows.append(("Received by", [received_by], received_by))
+    rows.append(("Date of booking", [booking_date], booking_date))
+    return rows
+
+
+def receipt_text(rows):
+    out = [f"Booking confirmed - {EXPO_TITLE}"]
+    out += [f"{label}: {text}" for label, _lines, text in rows]
+    out.append("Please keep your booking ID for any future contact.")
+    return "\n".join(out)
+
+
+def make_receipt_png(rows):
+    W, M, LABEL_W, LH = 900, 50, 290, 40
+    f_title, f_sub = _font(40, True), _font(24)
+    f_label, f_val = _font(24), _font(28, True)
+    laid, body_h = [], 0
+    for label, lines, _text in rows:
+        wrapped = []
+        for ln in lines:
+            wrapped += textwrap.wrap(str(ln), width=28) or [""]
+        laid.append((label, wrapped))
+        body_h += len(wrapped) * LH + 22
+    H = 190 + body_h + 110
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, W, 150], fill=(31, 111, 74))
+    d.text((M, 32), "Booking Confirmation", font=f_title, fill="white")
+    d.text((M, 95), EXPO_TITLE, font=f_sub, fill=(220, 240, 228))
+    y = 190
+    for label, wrapped in laid:
+        d.text((M, y + 6), label, font=f_label, fill=(110, 110, 110))
+        for i, ln in enumerate(wrapped):
+            d.text((M + LABEL_W, y + i * LH), ln, font=f_val, fill=(30, 30, 30))
+        y += len(wrapped) * LH + 22
+        d.line([M, y - 10, W - M, y - 10], fill=(228, 228, 228), width=2)
+    d.text((M, y + 20), "Please keep your booking ID for any future contact.", font=f_sub, fill=(90, 90, 90))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
 
 
 def secrets_get(key, default=None):
@@ -150,6 +235,56 @@ def read_all(_ws, title):
     return _ws.get_all_values()
 
 
+SUMMARY_TITLE = "Summary"
+
+
+def ensure_summary_sheet(sh):
+    """Creates a 'Summary' tab (first tab) with live formulas over the three event tabs.
+    Created once; if it already exists it is left alone so your own edits are never overwritten."""
+    if SUMMARY_TITLE in [w.title for w in sh.worksheets()]:
+        return
+    col = lambda name: chr(ord("A") + HEADERS.index(name))        # column letter of a heading
+    paid, contact, method = col("Paid Amount (This Event)"), col("Contact"), col("Payment Method")
+    ids = col("Booking ID")
+    q = lambda ev: f"'{ev}'"
+    rows = [["Stall Booking Summary", "", "", "", ""],
+            ["Updates automatically from the three event tabs. Do not type inside the tables.", "", "", "", ""],
+            ["", "", "", "", ""],
+            ["Event", "Stall bookings", "Payment collected (Rs)", "", ""]]
+    for i, ev in enumerate(EVENTS):
+        rows.append([ev, f"=COUNTA({q(ev)}!{ids}2:{ids})", f"=SUM({q(ev)}!{paid}2:{paid})", "", ""])
+    first, last = 5, 4 + len(EVENTS)
+    rows.append(["TOTAL", f"=SUM(B{first}:B{last})", f"=SUM(C{first}:C{last})", "", ""])
+    stack = ";".join(f"{q(ev)}!{contact}2:{contact}" for ev in EVENTS)
+    rows.append(["", "", "", "", ""])
+    rows.append(["Unique stalls (a stall booked for several events counts once)",
+                 f'=IFERROR(ROWS(UNIQUE(FILTER({{{stack}}},{{{stack}}}<>""))),0)', "", "", ""])
+    unpaid = "+".join(f'COUNTIF({q(ev)}!{method}2:{method},"No payment yet")' for ev in EVENTS)
+    rows.append(["Bookings with no payment yet", f"={unpaid}", "", "", ""])
+    rows.append(["", "", "", "", ""])
+    rows.append(["Payment collected by method (Rs)"] + EVENTS + ["Total"])
+    start = len(rows) + 1
+    for i, m in enumerate(PAYMENT_METHODS[:-1]):                   # all methods except 'No payment yet'
+        r = start + i
+        rows.append([m] + [f"=SUMIF({q(ev)}!{method}2:{method},$A{r},{q(ev)}!{paid}2:{paid})"
+                           for ev in EVENTS] + [f"=SUM(B{r}:D{r})"])
+    ws = sh.add_worksheet(title=SUMMARY_TITLE, rows=40, cols=6, index=0)
+    ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")
+    try:                                   # looks only; the numbers are already in place
+        bold = {"textFormat": {"bold": True}}
+        ws.format("A1", {"textFormat": {"bold": True, "fontSize": 16}})
+        ws.format("A4:C4", {**bold, "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}})
+        ws.format(f"A{last + 1}:C{last + 1}", bold)
+        hdr = start - 1
+        ws.format(f"A{hdr}:E{hdr}", {**bold, "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}})
+        ws.format("C5:C8", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
+        ws.format(f"B{start}:E{start + len(PAYMENT_METHODS) - 2}",
+                  {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
+        ws.columns_auto_resize(0, 4)
+    except Exception as e:  # noqa
+        print(f"Summary formatting skipped: {e}")
+
+
 def find_duplicates(sheets, events, brand, contact):
     hits = []
     b = brand.strip().casefold()
@@ -168,6 +303,24 @@ def find_duplicates(sheets, events, brand, contact):
 # ----------------------------------------------------------------------------
 # Files (logo + receipt)
 # ----------------------------------------------------------------------------
+def to_png(uploaded, max_side=1600):
+    """Turns an uploaded photo (JPG/PNG/WEBP) into PNG bytes. Fixes phone rotation and
+    shrinks very large photos (longest side 1600 px) so the PNG file stays a sensible size."""
+    try:
+        img = Image.open(io.BytesIO(uploaded.getvalue()))
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "RGBA", "L"):
+            img = img.convert("RGBA" if ("A" in img.mode or img.mode == "P") else "RGB")
+        if max(img.size) > max_side:
+            img.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        img.save(buf, "PNG", optimize=True)
+        return buf.getvalue()
+    except Exception as e:  # noqa
+        raise RuntimeError(f"Could not read the picture '{getattr(uploaded, 'name', '')}' ({e}). "
+                           "Please upload a JPG, PNG or WEBP photo.")
+
+
 def save_uploads(booking_id, logo, receipt):
     """Uploads to Google Drive when a folder is configured (always, when deployed online).
     On your own computer it also keeps a local copy. Returns (logo_ref, receipt_ref, warning)."""
@@ -185,17 +338,17 @@ def save_uploads(booking_id, logo, receipt):
 
     for label, f in (("logo", logo), ("receipt", receipt)):
         if f is None:
-            refs[label] = "No payment yet"
+            refs[label] = "No logo" if label == "logo" else "No payment yet"
             continue
-        ext = Path(f.name).suffix.lower() or ".bin"
-        data = f.getvalue()
+        ext = ".png"
+        data = to_png(f)                       # logo and receipt are always saved as PNG
         if local_dir:
             (local_dir / f"{label}{ext}").write_bytes(data)
             refs[label] = str(local_dir / f"{label}{ext}")
         if drive:
             try:
                 from googleapiclient.http import MediaIoBaseUpload
-                media = MediaIoBaseUpload(io.BytesIO(data), mimetype=f.type or "application/octet-stream")
+                media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/png")
                 made = drive.files().create(
                     body={"name": f"{booking_id}_{label}{ext}", "parents": [folder_id]},
                     media_body=media, fields="id,webViewLink",
@@ -301,7 +454,12 @@ if not cfg.get("sheet_url"):
 @st.cache_resource
 def connect(url):
     sh = open_spreadsheet(url)
-    return sh, ensure_event_sheets(sh)
+    sheets = ensure_event_sheets(sh)
+    try:
+        ensure_summary_sheet(sh)
+    except Exception as e:  # noqa - the summary is a bonus; never stop bookings because of it
+        print(f"Summary sheet could not be created: {e}")
+    return sh, sheets
 
 
 try:
@@ -328,7 +486,11 @@ with tab_new:
 
     if st.session_state.last_saved:
         st.success(st.session_state.last_saved["msg"])
-        st.caption("Copy this message to send to the stall owner:")
+        st.caption("Receipt for the stall owner - download the picture, or copy the text below:")
+        st.image(st.session_state.last_saved["png"], width=420)
+        st.download_button("⬇️ Download receipt (PNG)", data=st.session_state.last_saved["png"],
+                           file_name=f"receipt_{st.session_state.last_saved['file_tag']}.png",
+                           mime="image/png")
         st.code(st.session_state.last_saved["copy"], language=None)
 
     if st.session_state.parsed:
@@ -380,25 +542,29 @@ with tab_new:
         st.subheader("Step 3 - Payment details, logo and receipt")
         method = st.radio("How was the payment made?", PAYMENT_METHODS, index=None,
                           key="f_method", horizontal=True)
-        if method == "Cash":
-            st.text_input("Cash received by (name of the team member who took the cash)",
+        if method and method != "No payment yet":
+            st.text_input("Received by (team member who received or confirmed this payment)",
                           key="f_received")
+        if method == "Cash":
             st.caption("For cash, the receipt photo is optional (e.g. a photo of the handwritten "
                        "receipt or the cash handover).")
         u1, u2 = st.columns(2)
         with u1:
-            logo = st.file_uploader("Brand logo", type=["png", "jpg", "jpeg", "webp", "pdf"],
+            logo = st.file_uploader("Brand logo (optional) - saved as PNG",
+                                    type=["png", "jpg", "jpeg", "webp"],
                                     key=f"logo_{st.session_state.uploader_n}")
-            if logo and logo.type.startswith("image"):
+            if logo:
                 st.image(logo, width=160)
         with u2:
             receipt = st.file_uploader(
-                "Cash receipt / photo (optional)" if method == "Cash"
+                "Cash receipt / photo (optional) - saved as PNG" if method == "Cash"
                 else "No payment yet - nothing to upload" if method == "No payment yet"
-                else "Payment receipt", type=["png", "jpg", "jpeg", "webp", "pdf"],
+                else "Payment receipt - saved as PNG", type=["png", "jpg", "jpeg", "webp"],
                                        key=f"receipt_{st.session_state.uploader_n}")
-            if receipt and receipt.type.startswith("image"):
+            if receipt:
                 st.image(receipt, width=160)
+        st.caption("Only photos are accepted (JPG, PNG, WEBP) and they are saved as PNG. "
+                   "If you have a PDF receipt, take a screenshot of it and upload that.")
 
         # ------------------------- validation -------------------------------
         problems = []
@@ -408,8 +574,6 @@ with tab_new:
                 problems.append(f"{label} is empty.")
         if not events:
             problems.append("Select at least one event.")
-        if logo is None:
-            problems.append("Logo not uploaded.")
         if method is None:
             problems.append("Choose how the payment was made.")
         elif method == "No payment yet":
@@ -419,10 +583,9 @@ with tab_new:
         else:
             if paid <= 0:
                 problems.append("Paid amount is 0 - enter the amount, or choose 'No payment yet'.")
-            if method == "Cash":
-                if not st.session_state.f_received.strip():
-                    problems.append("Enter who received the cash.")
-            elif receipt is None:
+            if not st.session_state.f_received.strip():
+                problems.append("Enter who received the payment.")
+            if method != "Cash" and receipt is None:
                 problems.append("Payment receipt not uploaded.")
         if len(events) > 1 and abs(sum(amounts.values()) - paid) > 0.01:
             problems.append("Split amounts do not add up to the paid amount.")
@@ -470,7 +633,7 @@ with tab_new:
                                    st.session_state.f_date.strftime("%d-%b-%Y"),
                                    st.session_state.f_contact.strip(),
                                    logo_ref, receipt_ref, method,
-                                   st.session_state.f_received.strip() if method == "Cash" else "",
+                                   st.session_state.f_received.strip() if method != "No payment yet" else "",
                                    others]
                             sheets[ev].append_row(row, value_input_option="RAW")
                             saved_to.append(ev)
@@ -481,11 +644,14 @@ with tab_new:
                         st.stop()
             ids_text = ", ".join(f"{ids[e]} ({e})" for e in events)
             msg = f"Saved {brand_clean}. Booking ID(s): {ids_text}"
-            copy_text = (f"Booking confirmed - {brand_clean}\n"
-                         f"Booking ID(s): {ids_text}\n"
-                         "Please keep this ID for any future contact.")
+            rows_for_receipt = receipt_rows(
+                brand_clean, st.session_state.f_name.strip(), events, ids, amounts, paid, method,
+                st.session_state.f_received.strip() if method != "No payment yet" else "",
+                st.session_state.f_date.strftime("%d-%b-%Y"))
             st.cache_data.clear()
-            st.session_state.last_saved = {"msg": msg, "copy": copy_text}
+            st.session_state.last_saved = {"msg": msg, "copy": receipt_text(rows_for_receipt),
+                                           "png": make_receipt_png(rows_for_receipt),
+                                           "file_tag": "_".join(ids.values())}
             st.session_state.do_reset_now = True
             st.rerun()
 
@@ -581,7 +747,7 @@ with tab_search:
             cols = {"Booking ID": "Booking ID", "_event": "Event",
                     "Paid Amount (This Event)": "Paid (Rs)",
                     "Booking Date": "Booking date", "Payment Method": "Payment method",
-                    "Received By": "Cash received by"}
+                    "Received By": "Received by"}
             df = pd.DataFrame([{new: d.get(old, "") for old, new in cols.items()} for d in g])
             st.dataframe(df, hide_index=True)
             def _num(x):
