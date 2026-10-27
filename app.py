@@ -237,25 +237,29 @@ def read_all(_ws, title):
 
 SUMMARY_TITLE = "Summary"
 EXPENSE_TITLE = "Expenses"
-EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)"]
+EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)", "Taken By"]
 
 
 def ensure_expenses_sheet(sh):
-    """Creates the 'Expenses' tab (4 columns) if it does not exist yet."""
+    """Creates the 'Expenses' tab if it does not exist yet (and adds the Taken By column to an older one)."""
     existing = {w.title: w for w in sh.worksheets()}
     if EXPENSE_TITLE not in existing:
         ws = sh.add_worksheet(title=EXPENSE_TITLE, rows=1000, cols=len(EXPENSE_HEADERS))
         ws.append_row(EXPENSE_HEADERS, value_input_option="RAW")
         ws.freeze(rows=1)
         try:
-            ws.format("A1:D1", {"textFormat": {"bold": True},
+            ws.format("A1:E1", {"textFormat": {"bold": True},
                                 "backgroundColor": {"red": 0.98, "green": 0.9, "blue": 0.8}})
         except Exception as e:  # noqa
             print(f"Expenses formatting skipped: {e}")
         return ws
     ws = existing[EXPENSE_TITLE]
     first = ws.row_values(1)
-    if first != EXPENSE_HEADERS:
+    if first == EXPENSE_HEADERS[:4]:                       # older tab without 'Taken By': add the column
+        if ws.col_count < len(EXPENSE_HEADERS):
+            ws.add_cols(len(EXPENSE_HEADERS) - ws.col_count)
+        ws.update(range_name="A1:E1", values=[EXPENSE_HEADERS])
+    elif first != EXPENSE_HEADERS:
         if not any(ws.get_all_values()):
             ws.append_row(EXPENSE_HEADERS, value_input_option="RAW")
         else:
@@ -867,21 +871,32 @@ with tab_exp:
         st.error("The 'Expenses' tab could not be prepared in your Google Sheet. If a tab called "
                  "'Expenses' already exists with other headings, rename it and restart the app.")
     else:
+        _vals = read_all(expenses_ws, EXPENSE_TITLE)
+        known_names = sorted({" ".join(r[4].split()) for r in _vals[1:] if len(r) > 4 and r[4].strip()},
+                             key=str.casefold)
         with st.form("expense_form", clear_on_submit=True):
             e_date = st.date_input("Date", value=datetime.now(TZ).date(), format="DD/MM/YYYY")
             e_what = st.text_input("What was it for?", placeholder="e.g. Stage banner printing")
             e_amount = st.number_input("Amount (Rs)", min_value=0.0, step=100.0)
+            e_taken = st.text_input("Money taken by (name of the person who took the money)")
+            if known_names:
+                st.caption("Names used so far: " + ", ".join(known_names) +
+                           ". Type the name the same way each time so the totals add up.")
             e_dupe_ok = st.checkbox("Save even if an identical expense is already recorded")
             e_submit = st.form_submit_button("✅ Save expense", type="primary")
 
         if e_submit:
             what = " ".join(e_what.split())
+            taken_by = " ".join(e_taken.split())
+            st.session_state.exp_msg = None
             amount = int(e_amount) if float(e_amount).is_integer() else round(float(e_amount), 2)
             date_txt = e_date.strftime("%d-%b-%Y")
             if not what:
                 st.error("Please write what the expense was for. Nothing was saved.")
             elif amount <= 0:
                 st.error("The amount must be more than 0. Nothing was saved.")
+            elif not taken_by:
+                st.error("Please write who took the money. Nothing was saved.")
             else:
                 try:
                     with save_lock():
@@ -894,10 +909,10 @@ with tab_exp:
                                        "Nothing was saved. Tick the box if it is really a second one.")
                         else:
                             exp_id = next_expense_id(expenses_ws)
-                            expenses_ws.append_row([exp_id, date_txt, what, amount],
+                            expenses_ws.append_row([exp_id, date_txt, what, amount, taken_by],
                                                    value_input_option="RAW")
                             st.cache_data.clear()
-                            st.session_state.exp_msg = f"Saved {exp_id}: {what} - {rs(amount)} ({date_txt})"
+                            st.session_state.exp_msg = f"Saved {exp_id}: {what} - {rs(amount)} - taken by {taken_by} ({date_txt})"
                 except Exception as e:  # noqa
                     st.error(f"Nothing was saved: {e}")
         if st.session_state.get("exp_msg") and not e_submit:
@@ -910,7 +925,7 @@ with tab_exp:
             st.cache_data.clear()
             st.rerun()
         vals = read_all(expenses_ws, EXPENSE_TITLE)
-        data = [r + [""] * (4 - len(r)) for r in vals[1:]]
+        data = [r + [""] * (len(EXPENSE_HEADERS) - len(r)) for r in vals[1:]]
         spent = sum(_amount(r[3]) for r in data)
         collected = total_collected()
         c1, c2, c3 = st.columns(3)
@@ -918,7 +933,16 @@ with tab_exp:
         c2.metric("Total expenses", rs(spent))
         c3.metric("Profit so far", rs(collected - spent))
         if data:
-            df = pd.DataFrame(data, columns=EXPENSE_HEADERS).iloc[::-1]      # newest first
+            by_person = {}
+            for r in data:
+                name = " ".join(r[4].split()) or "(not recorded)"
+                by_person.setdefault(name.casefold(), [name, 0.0])[1] += _amount(r[3])
+            st.markdown("**Money taken, by person**")
+            st.dataframe(pd.DataFrame([{"Taken by": n, "Total taken": rs(a)}
+                                       for n, a in sorted(by_person.values(), key=lambda x: -x[1])]),
+                         hide_index=True)
+            st.markdown("**All expenses (newest first)**")
+            df = pd.DataFrame(data, columns=EXPENSE_HEADERS).iloc[::-1]
             st.dataframe(df, hide_index=True)
         else:
             st.caption("No expenses recorded yet.")
