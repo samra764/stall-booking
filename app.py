@@ -190,6 +190,8 @@ def ensure_event_sheets(sh):
         else:
             ws = existing[ev]
             first = ws.row_values(1)
+            if "Discount %" not in first:
+                first = fix_heading_case(ws, first, HEADERS)
             # the discount column was removed: delete it from older tabs (only when every
             # other heading is exactly what we expect, so nothing unknown is ever deleted)
             if "Discount %" in first:
@@ -237,6 +239,21 @@ def read_all(_ws, title):
 
 SUMMARY_TITLE = "Summary"
 EXPENSE_TITLE = "Expenses"
+
+
+def _norm(row):
+    return [" ".join(str(h).split()).casefold() for h in row]
+
+
+def fix_heading_case(ws, first, canonical):
+    """If the headings match except for capital letters / extra spaces (e.g. 'Taken by'),
+    rewrite them exactly as the app expects. Returns the (possibly corrected) first row."""
+    canon = canonical[:len(first)]
+    if first and first != canon and _norm(first) == _norm(canon):
+        ws.update(range_name=f"A1:{chr(64 + len(canon))}1", values=[canon])
+        return canon
+    return first
+SCHEMA_VERSION = "2026-10-27-tolerant-headings"   # bump when the sheet layout changes
 EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)", "Taken By", "Receipt Photo"]
 
 
@@ -254,7 +271,7 @@ def ensure_expenses_sheet(sh):
             print(f"Expenses formatting skipped: {e}")
         return ws
     ws = existing[EXPENSE_TITLE]
-    first = ws.row_values(1)
+    first = fix_heading_case(ws, ws.row_values(1), EXPENSE_HEADERS)
     if first in (EXPENSE_HEADERS[:4], EXPENSE_HEADERS[:5]):   # older tab: add the newer columns at the end
         if ws.col_count < len(EXPENSE_HEADERS):
             ws.add_cols(len(EXPENSE_HEADERS) - ws.col_count)
@@ -517,7 +534,7 @@ if not cfg.get("sheet_url"):
     st.stop()
 
 @st.cache_resource
-def connect(url):
+def connect(url, schema_version):
     sh = open_spreadsheet(url)
     sheets = ensure_event_sheets(sh)
     try:
@@ -533,7 +550,7 @@ def connect(url):
 
 
 try:
-    sh, sheets, expenses_ws = connect(cfg["sheet_url"])
+    sh, sheets, expenses_ws = connect(cfg["sheet_url"], SCHEMA_VERSION)
 except Exception as e:  # noqa
     st.error(f"Could not open the Google Sheet: {e}")
     st.stop()
