@@ -236,12 +236,72 @@ def read_all(_ws, title):
 
 
 SUMMARY_TITLE = "Summary"
+EXPENSE_TITLE = "Expenses"
+EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)"]
+
+
+def ensure_expenses_sheet(sh):
+    """Creates the 'Expenses' tab (4 columns) if it does not exist yet."""
+    existing = {w.title: w for w in sh.worksheets()}
+    if EXPENSE_TITLE not in existing:
+        ws = sh.add_worksheet(title=EXPENSE_TITLE, rows=1000, cols=len(EXPENSE_HEADERS))
+        ws.append_row(EXPENSE_HEADERS, value_input_option="RAW")
+        ws.freeze(rows=1)
+        try:
+            ws.format("A1:D1", {"textFormat": {"bold": True},
+                                "backgroundColor": {"red": 0.98, "green": 0.9, "blue": 0.8}})
+        except Exception as e:  # noqa
+            print(f"Expenses formatting skipped: {e}")
+        return ws
+    ws = existing[EXPENSE_TITLE]
+    first = ws.row_values(1)
+    if first != EXPENSE_HEADERS:
+        if not any(ws.get_all_values()):
+            ws.append_row(EXPENSE_HEADERS, value_input_option="RAW")
+        else:
+            raise RuntimeError("The 'Expenses' tab already has data with different column headings. "
+                               "Rename or delete it so the app can create it correctly.")
+    return ws
+
+
+def next_expense_id(ws):
+    top = 0
+    for v in ws.col_values(1)[1:]:
+        m = re.fullmatch(r"EXP-(\d+)", v.strip())
+        if m:
+            top = max(top, int(m.group(1)))
+    return f"EXP-{top + 1:03d}"
+
+
+def write_profit_block(ws):
+    """Adds the 'Profit' lines to the Summary tab (rows 19-22), only if that spot is empty."""
+    try:
+        cur = ws.get_values("A19:B22")
+        if any(any(str(c).strip() for c in r) for r in cur):
+            return
+        amount_col = chr(ord("A") + EXPENSE_HEADERS.index("Amount (Rs)"))
+        rows = [["Profit", "Amount (Rs)"],
+                ["Total collected from stalls", "=C8"],
+                ["Total expenses", f"=SUM('{EXPENSE_TITLE}'!{amount_col}2:{amount_col})"],
+                ["PROFIT (collected - expenses)", "=B20-B21"]]
+        ws.update(range_name="A19", values=rows, value_input_option="USER_ENTERED")
+        try:
+            green = {"backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}}
+            ws.format("A19:B19", {"textFormat": {"bold": True}, **green})
+            ws.format("B20:B22", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
+            ws.format("A22:B22", {"textFormat": {"bold": True}})
+        except Exception as e:  # noqa
+            print(f"Profit block formatting skipped: {e}")
+    except Exception as e:  # noqa
+        print(f"Profit block could not be written: {e}")
 
 
 def ensure_summary_sheet(sh):
     """Creates a 'Summary' tab (first tab) with live formulas over the three event tabs.
     Created once; if it already exists it is left alone so your own edits are never overwritten."""
-    if SUMMARY_TITLE in [w.title for w in sh.worksheets()]:
+    existing = {w.title: w for w in sh.worksheets()}
+    if SUMMARY_TITLE in existing:             # already there: only add the new Profit lines if missing
+        write_profit_block(existing[SUMMARY_TITLE])
         return
     col = lambda name: chr(ord("A") + HEADERS.index(name))        # column letter of a heading
     paid, contact, method = col("Paid Amount (This Event)"), col("Contact"), col("Payment Method")
@@ -283,6 +343,7 @@ def ensure_summary_sheet(sh):
         ws.columns_auto_resize(0, 4)
     except Exception as e:  # noqa
         print(f"Summary formatting skipped: {e}")
+    write_profit_block(ws)
 
 
 def find_duplicates(sheets, events, brand, contact):
@@ -456,14 +517,19 @@ def connect(url):
     sh = open_spreadsheet(url)
     sheets = ensure_event_sheets(sh)
     try:
+        expenses_ws = ensure_expenses_sheet(sh)
+    except Exception as e:  # noqa
+        expenses_ws = None
+        print(f"Expenses sheet problem: {e}")
+    try:
         ensure_summary_sheet(sh)
     except Exception as e:  # noqa - the summary is a bonus; never stop bookings because of it
         print(f"Summary sheet could not be created: {e}")
-    return sh, sheets
+    return sh, sheets, expenses_ws
 
 
 try:
-    sh, sheets = connect(cfg["sheet_url"])
+    sh, sheets, expenses_ws = connect(cfg["sheet_url"])
 except Exception as e:  # noqa
     st.error(f"Could not open the Google Sheet: {e}")
     st.stop()
@@ -474,7 +540,7 @@ st.sidebar.success(f"Connected: {sh.title}")
 # Main UI
 # ----------------------------------------------------------------------------
 st.title("🧾 Stall Booking Records")
-tab_new, tab_view, tab_search = st.tabs(["➕ New booking", "📊 Records", "🔎 Search"])
+tab_new, tab_view, tab_search, tab_exp = st.tabs(["➕ New booking", "📊 Records", "🔎 Search", "💸 Expenses"])
 
 with tab_new:
     st.subheader("Step 1 - Paste the booking details")
@@ -769,3 +835,90 @@ with tab_search:
                     else:
                         st.caption(f"{label}: {ref}")
             st.divider()
+
+
+# ----------------------------------------------------------------------------
+# Expenses tab
+# ----------------------------------------------------------------------------
+def _amount(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def total_collected():
+    total = 0.0
+    for ev in EVENTS:
+        vals = read_all(sheets[ev], ev)
+        if len(vals) > 1 and "Paid Amount (This Event)" in vals[0]:
+            i = vals[0].index("Paid Amount (This Event)")
+            total += sum(_amount(r[i]) for r in vals[1:] if len(r) > i)
+    return total
+
+
+def rs(x):
+    return f"Rs {x:,.0f}" if float(x).is_integer() else f"Rs {x:,.2f}"
+
+
+with tab_exp:
+    st.subheader("Add an expense")
+    if expenses_ws is None:
+        st.error("The 'Expenses' tab could not be prepared in your Google Sheet. If a tab called "
+                 "'Expenses' already exists with other headings, rename it and restart the app.")
+    else:
+        with st.form("expense_form", clear_on_submit=True):
+            e_date = st.date_input("Date", value=datetime.now(TZ).date(), format="DD/MM/YYYY")
+            e_what = st.text_input("What was it for?", placeholder="e.g. Stage banner printing")
+            e_amount = st.number_input("Amount (Rs)", min_value=0.0, step=100.0)
+            e_dupe_ok = st.checkbox("Save even if an identical expense is already recorded")
+            e_submit = st.form_submit_button("✅ Save expense", type="primary")
+
+        if e_submit:
+            what = " ".join(e_what.split())
+            amount = int(e_amount) if float(e_amount).is_integer() else round(float(e_amount), 2)
+            date_txt = e_date.strftime("%d-%b-%Y")
+            if not what:
+                st.error("Please write what the expense was for. Nothing was saved.")
+            elif amount <= 0:
+                st.error("The amount must be more than 0. Nothing was saved.")
+            else:
+                try:
+                    with save_lock():
+                        existing_rows = expenses_ws.get_all_values()[1:]
+                        same = [r for r in existing_rows if len(r) >= 4 and r[1] == date_txt
+                                and r[2].strip().casefold() == what.casefold()
+                                and _amount(r[3]) == float(amount)]
+                        if same and not e_dupe_ok:
+                            st.warning(f"An identical expense is already recorded ({same[0][0]}). "
+                                       "Nothing was saved. Tick the box if it is really a second one.")
+                        else:
+                            exp_id = next_expense_id(expenses_ws)
+                            expenses_ws.append_row([exp_id, date_txt, what, amount],
+                                                   value_input_option="RAW")
+                            st.cache_data.clear()
+                            st.session_state.exp_msg = f"Saved {exp_id}: {what} - {rs(amount)} ({date_txt})"
+                except Exception as e:  # noqa
+                    st.error(f"Nothing was saved: {e}")
+        if st.session_state.get("exp_msg") and not e_submit:
+            st.success(st.session_state.exp_msg)
+        elif e_submit and st.session_state.get("exp_msg"):
+            st.success(st.session_state.exp_msg)
+
+        st.divider()
+        if st.button("🔄 Refresh", key="refresh_exp"):
+            st.cache_data.clear()
+            st.rerun()
+        vals = read_all(expenses_ws, EXPENSE_TITLE)
+        data = [r + [""] * (4 - len(r)) for r in vals[1:]]
+        spent = sum(_amount(r[3]) for r in data)
+        collected = total_collected()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Collected from stalls", rs(collected))
+        c2.metric("Total expenses", rs(spent))
+        c3.metric("Profit so far", rs(collected - spent))
+        if data:
+            df = pd.DataFrame(data, columns=EXPENSE_HEADERS).iloc[::-1]      # newest first
+            st.dataframe(df, hide_index=True)
+        else:
+            st.caption("No expenses recorded yet.")
