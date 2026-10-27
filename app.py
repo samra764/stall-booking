@@ -237,7 +237,7 @@ def read_all(_ws, title):
 
 SUMMARY_TITLE = "Summary"
 EXPENSE_TITLE = "Expenses"
-EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)", "Taken By"]
+EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)", "Taken By", "Receipt Photo"]
 
 
 def ensure_expenses_sheet(sh):
@@ -248,17 +248,17 @@ def ensure_expenses_sheet(sh):
         ws.append_row(EXPENSE_HEADERS, value_input_option="RAW")
         ws.freeze(rows=1)
         try:
-            ws.format("A1:E1", {"textFormat": {"bold": True},
+            ws.format("A1:F1", {"textFormat": {"bold": True},
                                 "backgroundColor": {"red": 0.98, "green": 0.9, "blue": 0.8}})
         except Exception as e:  # noqa
             print(f"Expenses formatting skipped: {e}")
         return ws
     ws = existing[EXPENSE_TITLE]
     first = ws.row_values(1)
-    if first == EXPENSE_HEADERS[:4]:                       # older tab without 'Taken By': add the column
+    if first in (EXPENSE_HEADERS[:4], EXPENSE_HEADERS[:5]):   # older tab: add the newer columns at the end
         if ws.col_count < len(EXPENSE_HEADERS):
             ws.add_cols(len(EXPENSE_HEADERS) - ws.col_count)
-        ws.update(range_name="A1:E1", values=[EXPENSE_HEADERS])
+        ws.update(range_name="A1:F1", values=[EXPENSE_HEADERS])
     elif first != EXPENSE_HEADERS:
         if not any(ws.get_all_values()):
             ws.append_row(EXPENSE_HEADERS, value_input_option="RAW")
@@ -882,6 +882,8 @@ with tab_exp:
             if known_names:
                 st.caption("Names used so far: " + ", ".join(known_names) +
                            ". Type the name the same way each time so the totals add up.")
+            e_receipt = st.file_uploader("Receipt photo as proof (optional) - saved as PNG",
+                                         type=["png", "jpg", "jpeg", "webp"], key="exp_receipt")
             e_dupe_ok = st.checkbox("Save even if an identical expense is already recorded")
             e_submit = st.form_submit_button("✅ Save expense", type="primary")
 
@@ -909,10 +911,15 @@ with tab_exp:
                                        "Nothing was saved. Tick the box if it is really a second one.")
                         else:
                             exp_id = next_expense_id(expenses_ws)
-                            expenses_ws.append_row([exp_id, date_txt, what, amount, taken_by],
+                            receipt_ref, photo_warn = "No receipt photo", None
+                            if e_receipt is not None:
+                                _, receipt_ref, photo_warn = save_uploads(exp_id, None, e_receipt)
+                            expenses_ws.append_row([exp_id, date_txt, what, amount, taken_by, receipt_ref],
                                                    value_input_option="RAW")
+                            if photo_warn:
+                                st.warning(photo_warn)
                             st.cache_data.clear()
-                            st.session_state.exp_msg = f"Saved {exp_id}: {what} - {rs(amount)} - taken by {taken_by} ({date_txt})"
+                            st.session_state.exp_msg = f"Saved {exp_id}: {what} - {rs(amount)} - taken by {taken_by} ({date_txt})" + ("" if e_receipt is None else " - receipt photo saved")
                 except Exception as e:  # noqa
                     st.error(f"Nothing was saved: {e}")
         if st.session_state.get("exp_msg") and not e_submit:
@@ -943,6 +950,11 @@ with tab_exp:
                          hide_index=True)
             st.markdown("**All expenses (newest first)**")
             df = pd.DataFrame(data, columns=EXPENSE_HEADERS).iloc[::-1]
-            st.dataframe(df, hide_index=True)
+            df["Receipt Photo"] = [x if x.startswith("http") else None for x in df["Receipt Photo"]]
+            st.dataframe(df, hide_index=True,
+                         column_config={"Receipt Photo": st.column_config.LinkColumn(
+                             "Receipt photo", display_text="Open")})
+            missing = sum(1 for r in data if not r[5].strip() or r[5].strip() == "No receipt photo")
+            st.caption(f"{missing} of {len(data)} expenses have no receipt photo.")
         else:
             st.caption("No expenses recorded yet.")
