@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import io
 import json
@@ -11,11 +12,13 @@ from zoneinfo import ZoneInfo
 import gspread
 import pandas as pd
 import streamlit as st
+from dateutil import parser as dateparser
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials
 
-from booking_parser import EVENTS, PAYMENT_METHODS, parse_text, split_amount
+from booking_parser import (EVENTS, PAYMENT_METHODS, normalize_contact, parse_date,
+                            parse_text, split_amount)
 
 # ----------------------------------------------------------------------------
 # Settings
@@ -253,7 +256,7 @@ def fix_heading_case(ws, first, canonical):
         ws.update(range_name=f"A1:{chr(64 + len(canon))}1", values=[canon])
         return canon
     return first
-SCHEMA_VERSION = "2026-10-27-tolerant-headings"   # bump when the sheet layout changes
+SCHEMA_VERSION = "2026-10-28-edit-log"   # bump when the sheet layout changes
 EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)", "Taken By", "Receipt Photo"]
 
 
@@ -285,9 +288,40 @@ def ensure_expenses_sheet(sh):
     return ws
 
 
-def next_expense_id(ws):
+LOG_TITLE = "Edit Log"
+LOG_HEADERS = ["Time", "Edited By", "Record Type", "ID", "Field", "Old Value", "New Value", "Reason"]
+
+
+def ensure_log_sheet(sh):
+    """Creates the 'Edit Log' tab: one row for every change ever made to a saved record."""
+    existing = {w.title: w for w in sh.worksheets()}
+    if LOG_TITLE not in existing:
+        ws = sh.add_worksheet(title=LOG_TITLE, rows=2000, cols=len(LOG_HEADERS))
+        ws.append_row(LOG_HEADERS, value_input_option="RAW")
+        ws.freeze(rows=1)
+        try:
+            ws.format("A1:H1", {"textFormat": {"bold": True},
+                                "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.97}})
+        except Exception as e:  # noqa
+            print(f"Edit Log formatting skipped: {e}")
+        return ws
+    ws = existing[LOG_TITLE]
+    first = fix_heading_case(ws, ws.row_values(1), LOG_HEADERS)
+    if first != LOG_HEADERS:
+        if not any(ws.get_all_values()):
+            ws.append_row(LOG_HEADERS, value_input_option="RAW")
+        else:
+            raise RuntimeError("The 'Edit Log' tab already has data with different column headings.")
+    return ws
+
+
+def next_expense_id(ws, log_ws=None):
+    """EXP-001, EXP-002 ... never re-using a number, even one that was deleted (the Edit Log remembers it)."""
     top = 0
-    for v in ws.col_values(1)[1:]:
+    ids = list(ws.col_values(1)[1:])
+    if log_ws is not None:
+        ids += log_ws.col_values(4)[1:]
+    for v in ids:
         m = re.fullmatch(r"EXP-(\d+)", v.strip())
         if m:
             top = max(top, int(m.group(1)))
@@ -543,14 +577,19 @@ def connect(url, schema_version):
         expenses_ws = None
         print(f"Expenses sheet problem: {e}")
     try:
+        log_ws = ensure_log_sheet(sh)
+    except Exception as e:  # noqa
+        log_ws = None
+        print(f"Edit Log problem: {e}")
+    try:
         ensure_summary_sheet(sh)
     except Exception as e:  # noqa - the summary is a bonus; never stop bookings because of it
         print(f"Summary sheet could not be created: {e}")
-    return sh, sheets, expenses_ws
+    return sh, sheets, expenses_ws, log_ws
 
 
 try:
-    sh, sheets, expenses_ws = connect(cfg["sheet_url"], SCHEMA_VERSION)
+    sh, sheets, expenses_ws, log_ws = connect(cfg["sheet_url"], SCHEMA_VERSION)
 except Exception as e:  # noqa
     st.error(f"Could not open the Google Sheet: {e}")
     st.stop()
@@ -561,7 +600,8 @@ st.sidebar.success(f"Connected: {sh.title}")
 # Main UI
 # ----------------------------------------------------------------------------
 st.title("🧾 Stall Booking Records")
-tab_new, tab_view, tab_search, tab_exp = st.tabs(["➕ New booking", "📊 Records", "🔎 Search", "💸 Expenses"])
+tab_new, tab_view, tab_search, tab_exp, tab_edit = st.tabs(
+    ["➕ New booking", "📊 Records", "🔎 Search", "💸 Expenses", "✏️ Edit booking"])
 
 with tab_new:
     st.subheader("Step 1 - Paste the booking details")
@@ -927,7 +967,7 @@ with tab_exp:
                             st.warning(f"An identical expense is already recorded ({same[0][0]}). "
                                        "Nothing was saved. Tick the box if it is really a second one.")
                         else:
-                            exp_id = next_expense_id(expenses_ws)
+                            exp_id = next_expense_id(expenses_ws, log_ws)
                             receipt_ref, photo_warn = "No receipt photo", None
                             if e_receipt is not None:
                                 _, receipt_ref, photo_warn = save_uploads(exp_id, None, e_receipt)
@@ -975,3 +1015,357 @@ with tab_exp:
             st.caption(f"{missing} of {len(data)} expenses have no receipt photo.")
         else:
             st.caption("No expenses recorded yet.")
+
+
+# ----------------------------------------------------------------------------
+# Editing saved records (bookings and expenses)
+# ----------------------------------------------------------------------------
+ID_RE = re.compile(r"[A-Z]{3}-\d+")
+NO_REF = ("", "No payment yet", "Cash - no receipt photo", "No receipt photo", "No logo")
+COL = {h: i for i, h in enumerate(HEADERS)}                     # heading -> column position
+SHARED_FIELDS = ["Name", "Brand Name", "Brand Items", "Booking Date", "Contact", "Logo",
+                 "Payment Receipt", "Payment Method", "Received By"]
+
+
+def has_ref(ref):
+    return str(ref).strip() not in NO_REF
+
+
+def clean_num(x):
+    x = float(x)
+    return int(x) if x.is_integer() else round(x, 2)
+
+
+def now_text():
+    return datetime.now(TZ).strftime("%d-%b-%Y %H:%M:%S")
+
+
+def fresh_row(ws, rid, width):
+    """Reads the sheet again right now and returns (row number, row values) for an ID."""
+    for i, r in enumerate(ws.get_all_values(), start=1):
+        if r and r[0] == rid:
+            return i, ([str(c) for c in r] + [""] * width)[:width]
+    return None, None
+
+
+def booking_groups():
+    """A booking = all the event rows linked to each other (JAC-001 + QWL-001 ...)."""
+    rows = load_all_rows()
+    by_id = {r.get("Booking ID", ""): r for r in rows if r.get("Booking ID")}
+    groups, seen = [], set()
+    for r in rows:
+        rid = r.get("Booking ID", "")
+        if not rid or rid in seen:
+            continue
+        linked = [rid] + [i for i in ID_RE.findall(r.get("Other IDs of This Booking", ""))
+                          if i in by_id and i != rid]
+        seen.update(linked)
+        groups.append([by_id[i] for i in linked])
+
+    def newest(g):
+        try:
+            return dateparser.parse(g[0].get("Saved At", ""), dayfirst=True)
+        except Exception:  # noqa
+            return datetime.min
+    return sorted(groups, key=newest, reverse=True)
+
+
+def group_label(g):
+    return f"{', '.join(d['Booking ID'] for d in g)} - {g[0].get('Brand Name', '')} ({g[0].get('Name', '')})"
+
+
+def render_booking_editor(g):
+    ids = [d["Booking ID"] for d in g]
+    snap = {d["Booking ID"]: [str(d.get(h, "")) for h in HEADERS] for d in g}
+    sig = hashlib.md5(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:8]
+    first = snap[ids[0]]
+    st.caption("Events in this booking: " + ", ".join(f"{d['Booking ID']} ({d['_event']})" for d in g))
+    for label, col in (("logo", "Logo"), ("receipt", "Payment Receipt")):
+        ref = first[COL[col]]
+        if ref.startswith("http"):
+            st.link_button(f"Open current {label}", ref)
+        else:
+            st.caption(f"Current {label}: {ref or '-'}")
+    try:
+        cur_date = parse_date(first[COL["Booking Date"]])
+    except ValueError:
+        cur_date = datetime.now(TZ).date()
+    cur_method = first[COL["Payment Method"]]
+
+    with st.form(f"edit_booking_{sig}"):
+        name = st.text_input("Name", value=first[COL["Name"]])
+        brand = st.text_input("Brand Name", value=first[COL["Brand Name"]])
+        items = st.text_area("Brand Items", value=first[COL["Brand Items"]])
+        contact = st.text_input("Contact", value=first[COL["Contact"]])
+        bdate = st.date_input("Booking date", value=cur_date, format="DD/MM/YYYY")
+        method = st.radio("Payment method", PAYMENT_METHODS, horizontal=True,
+                          index=PAYMENT_METHODS.index(cur_method) if cur_method in PAYMENT_METHODS else None)
+        received = st.text_input("Received by", value=first[COL["Received By"]])
+        st.markdown("**Paid amount for each event (Rs)**")
+        amounts = {}
+        for c, d in zip(st.columns(len(g)), g):
+            with c:
+                rid = d["Booking ID"]
+                amounts[rid] = st.number_input(f"{d['_event']} ({rid})", min_value=0.0, step=500.0,
+                                               value=float(_amount(snap[rid][COL["Paid Amount (This Event)"]])))
+        new_logo = st.file_uploader("Add or replace the logo (optional) - saved as PNG",
+                                    type=["png", "jpg", "jpeg", "webp"])
+        new_receipt = st.file_uploader("Add or replace the payment receipt (optional) - saved as PNG",
+                                       type=["png", "jpg", "jpeg", "webp"])
+        edited_by = st.text_input("Edited by (your name)")
+        reason = st.text_input("Reason for the change (optional)")
+        submitted = st.form_submit_button("💾 Save changes", type="primary")
+    if not submitted:
+        return
+
+    # ---------------- checks ----------------
+    name, brand, items, received = (" ".join(x.split()) for x in (name, brand, items, received))
+    total = round(sum(amounts.values()), 2)
+    problems = []
+    for lab, val in (("Name", name), ("Brand Name", brand), ("Brand Items", items),
+                     ("Contact", contact.strip()), ("Edited by", " ".join(edited_by.split()))):
+        if not val:
+            problems.append(f"{lab} cannot be empty.")
+    if method is None:
+        problems.append("Choose the payment method.")
+    elif method == "No payment yet":
+        if total != 0:
+            problems.append("Payment method is 'No payment yet' but amounts are entered - set them to 0 "
+                            "or choose the real payment method.")
+    else:
+        if total <= 0:
+            problems.append("The paid amounts are all 0 - enter them, or choose 'No payment yet'.")
+        if not received:
+            problems.append("Enter who received the payment.")
+        if method != "Cash" and new_receipt is None and not has_ref(first[COL["Payment Receipt"]]):
+            problems.append("This payment method needs a receipt photo - please add one.")
+    if problems:
+        st.error("Nothing was saved:\n\n" + "\n".join(f"- {p}" for p in problems))
+        return
+    contact_clean, contact_warn = normalize_contact(contact)
+    if contact_warn:
+        st.warning(contact_warn)
+
+    # ---------------- build the new rows ----------------
+    new_logo_ref, new_receipt_ref = first[COL["Logo"]], first[COL["Payment Receipt"]]
+    newrows = {}
+    for rid in ids:
+        row = list(snap[rid])
+        row[COL["Name"]], row[COL["Brand Name"]], row[COL["Brand Items"]] = name, brand, items
+        row[COL["Booking Date"]] = bdate.strftime("%d-%b-%Y")
+        row[COL["Contact"]] = contact_clean
+        row[COL["Payment Method"]] = method
+        row[COL["Received By"]] = "" if method == "No payment yet" else received
+        newrows[rid] = row
+
+    with save_lock():
+        # 1) has someone else changed these rows since they were loaded?
+        locs = {}
+        for d in g:
+            rid = d["Booking ID"]
+            rownum, cur = fresh_row(sheets[d["_event"]], rid, len(HEADERS))
+            if rownum is None or cur != [str(x) for x in snap[rid]][:len(HEADERS)]:
+                st.error("This booking was changed by someone else (or removed) while you were editing. "
+                         "Nothing was saved. Choose it again to see the latest version.")
+                return
+            locs[rid] = rownum
+        # 2) new photos (before anything is written)
+        if new_logo is not None or new_receipt is not None:
+            tag = "_".join(ids) + "_edit_" + datetime.now(TZ).strftime("%H%M%S")
+            try:
+                lref, rref, warn = save_uploads(tag, new_logo, new_receipt)
+            except Exception as e:  # noqa
+                st.error(f"Nothing was saved. {e}")
+                return
+            if new_logo is not None:
+                new_logo_ref = lref
+            if new_receipt is not None:
+                new_receipt_ref = rref
+            if warn:
+                st.warning(warn)
+        for rid in ids:
+            newrows[rid][COL["Logo"]], newrows[rid][COL["Payment Receipt"]] = new_logo_ref, new_receipt_ref
+            newrows[rid][COL["Paid Amount (This Event)"]] = clean_num(amounts[rid])
+            newrows[rid][COL["Total Paid (Whole Booking)"]] = clean_num(total)
+        # 3) what exactly changed (for the Edit Log)
+        old0, new0 = snap[ids[0]], newrows[ids[0]]
+        who, joined = " ".join(edited_by.split()), ", ".join(ids)
+        changes = [(joined, f, old0[COL[f]], str(new0[COL[f]])) for f in SHARED_FIELDS
+                   if old0[COL[f]] != str(new0[COL[f]])]
+        for rid in ids:
+            j = COL["Paid Amount (This Event)"]
+            if float(_amount(snap[rid][j])) != float(newrows[rid][j]):
+                changes.append((rid, "Paid Amount (This Event)", snap[rid][j], str(newrows[rid][j])))
+        if not changes:
+            st.info("Nothing was changed, so nothing was saved.")
+            return
+        # 4) write
+        done = []
+        try:
+            for d in g:
+                rid, r = d["Booking ID"], locs[d["Booking ID"]]
+                sheets[d["_event"]].update(range_name=f"A{r}:{LAST_COL}{r}", values=[newrows[rid]],
+                                           value_input_option="RAW")
+                done.append(rid)
+        except Exception as e:  # noqa
+            st.error(f"Only some rows were updated ({', '.join(done) or 'none'}) before an error: {e}. "
+                     "Open the booking again and check it.")
+            return
+        try:
+            stamp = now_text()
+            log_ws.append_rows([[stamp, who, "Booking", i, f, o, n, reason.strip()]
+                                for i, f, o, n in changes], value_input_option="RAW")
+        except Exception as e:  # noqa
+            st.warning(f"The changes were saved but could not be written to the Edit Log: {e}")
+    st.cache_data.clear()
+    st.session_state.edit_msg = f"Saved the changes to {', '.join(ids)} ({len(changes)} change(s) logged)."
+    st.session_state.reset_edit_choice = True
+    st.rerun()
+
+
+def render_expense_editor():
+    st.divider()
+    st.subheader("Edit or delete an expense")
+    if log_ws is None:
+        st.error("The 'Edit Log' tab could not be prepared, so editing is switched off.")
+        return
+    msg = st.session_state.pop("exp_edit_msg", None)
+    if msg:
+        st.success(msg)
+    vals = read_all(expenses_ws, EXPENSE_TITLE)
+    width = len(EXPENSE_HEADERS)
+    rows = [([str(c) for c in r] + [""] * width)[:width] for r in vals[1:] if r and r[0]]
+    if not rows:
+        st.caption("No expenses to edit yet.")
+        return
+    labels = [f"{r[0]} - {r[2]} - Rs {_amount(r[3]):,.0f} - {r[4] or 'no name'}" for r in reversed(rows)]
+    by_label = dict(zip(labels, reversed(rows)))
+    if st.session_state.pop("reset_exp_choice", False):
+        st.session_state["exp_choice"] = None
+    choice = st.selectbox("Choose the expense (type to search)", labels, index=None, key="exp_choice")
+    if choice is None:
+        return
+    snap = by_label[choice]
+    rid = snap[0]
+    sig = hashlib.md5(json.dumps(snap).encode()).hexdigest()[:8]
+    ref = snap[5]
+    if ref.startswith("http"):
+        st.link_button("Open current receipt photo", ref)
+    else:
+        st.caption(f"Current receipt photo: {ref or '-'}")
+    try:
+        cur_date = datetime.strptime(snap[1], "%d-%b-%Y").date()
+    except ValueError:
+        cur_date = datetime.now(TZ).date()
+    with st.form(f"edit_expense_{sig}"):
+        e_date = st.date_input("Date", value=cur_date, format="DD/MM/YYYY")
+        e_what = st.text_input("What was it for?", value=snap[2])
+        e_amount = st.number_input("Amount (Rs)", min_value=0.0, step=100.0, value=float(_amount(snap[3])))
+        e_taken = st.text_input("Money taken by", value=snap[4])
+        e_photo = st.file_uploader("Add or replace the receipt photo (optional) - saved as PNG",
+                                   type=["png", "jpg", "jpeg", "webp"])
+        e_by = st.text_input("Edited by (your name)")
+        e_reason = st.text_input("Reason (optional)")
+        c_save, c_del = st.columns(2)
+        with c_save:
+            do_save = st.form_submit_button("💾 Save changes", type="primary")
+        with c_del:
+            do_delete = st.form_submit_button("🗑 Delete this expense")
+        confirm = st.checkbox("To delete, tick here to confirm (the deleted entry stays in the Edit Log)")
+    if not (do_save or do_delete):
+        return
+    who = " ".join(e_by.split())
+    if not who:
+        st.error("Please write your name in 'Edited by'. Nothing was changed.")
+        return
+    if do_delete and not confirm:
+        st.error("Tick the confirmation box to delete. Nothing was changed.")
+        return
+    what, taken = " ".join(e_what.split()), " ".join(e_taken.split())
+    if do_save and (not what or not taken or e_amount <= 0):
+        st.error("What it was for, the amount (more than 0) and who took the money are all required. "
+                 "Nothing was saved.")
+        return
+
+    with save_lock():
+        rownum, cur = fresh_row(expenses_ws, rid, width)
+        if rownum is None or cur != snap:
+            st.error("This expense was changed by someone else (or removed) while you were editing. "
+                     "Nothing was saved. Choose it again to see the latest version.")
+            return
+        stamp = now_text()
+        if do_delete:
+            try:
+                expenses_ws.delete_rows(rownum)
+                log_ws.append_rows([[stamp, who, "Expense", rid, f, snap[i], "(deleted)", e_reason.strip()]
+                                    for i, f in enumerate(EXPENSE_HEADERS)], value_input_option="RAW")
+            except Exception as e:  # noqa
+                st.error(f"The delete did not finish: {e}. Please check the Expenses tab.")
+                return
+            st.cache_data.clear()
+            st.session_state.exp_edit_msg = f"Deleted {rid}. It is recorded in the Edit Log."
+        else:
+            new_ref = snap[5]
+            if e_photo is not None:
+                try:
+                    _, new_ref, warn = save_uploads(f"{rid}_edit_{datetime.now(TZ):%H%M%S}", None, e_photo)
+                except Exception as e:  # noqa
+                    st.error(f"Nothing was saved. {e}")
+                    return
+                if warn:
+                    st.warning(warn)
+            new = [rid, e_date.strftime("%d-%b-%Y"), what, clean_num(e_amount), taken, new_ref]
+            changes = [(f, snap[i], str(new[i])) for i, f in enumerate(EXPENSE_HEADERS)
+                       if i and snap[i] != str(new[i])]
+            if not changes:
+                st.info("Nothing was changed, so nothing was saved.")
+                return
+            try:
+                expenses_ws.update(range_name=f"A{rownum}:F{rownum}", values=[new], value_input_option="RAW")
+            except Exception as e:  # noqa
+                st.error(f"Nothing was saved: {e}")
+                return
+            try:
+                log_ws.append_rows([[stamp, who, "Expense", rid, f, o, n, e_reason.strip()]
+                                    for f, o, n in changes], value_input_option="RAW")
+            except Exception as e:  # noqa
+                st.warning(f"The change was saved but could not be written to the Edit Log: {e}")
+            st.cache_data.clear()
+            st.session_state.exp_edit_msg = f"Saved the changes to {rid} ({len(changes)} change(s) logged)."
+    st.session_state.reset_exp_choice = True
+    st.rerun()
+
+
+with tab_exp:
+    if expenses_ws is not None:
+        render_expense_editor()
+
+with tab_edit:
+    st.subheader("Edit a saved booking")
+    st.caption("Change or add details of a booking that is already saved. Every change is written to the "
+               "'Edit Log' tab, with the old and new value, your name and the time.")
+    if log_ws is None:
+        st.error("The 'Edit Log' tab could not be prepared in your Google Sheet, so editing is switched off. "
+                 "If a tab called 'Edit Log' already exists with other headings, rename it and restart the app.")
+    else:
+        msg = st.session_state.pop("edit_msg", None)
+        if msg:
+            st.success(msg)
+        if st.session_state.pop("reset_edit_choice", False):
+            st.session_state["edit_choice"] = None
+        groups = booking_groups()
+        if not groups:
+            st.caption("No bookings saved yet.")
+        else:
+            labels = [group_label(g) for g in groups]
+            choice = st.selectbox("Choose the booking (type a brand, person, phone number or ID to search)",
+                                  labels, index=None, key="edit_choice")
+            if choice is not None:
+                render_booking_editor(groups[labels.index(choice)])
+        with st.expander("Recent changes (Edit Log)"):
+            lv = read_all(log_ws, LOG_TITLE)
+            if len(lv) > 1:
+                ld = [([str(c) for c in r] + [""] * len(LOG_HEADERS))[:len(LOG_HEADERS)] for r in lv[1:]]
+                st.dataframe(pd.DataFrame(ld, columns=LOG_HEADERS).iloc[::-1].head(40), hide_index=True)
+            else:
+                st.caption("No changes recorded yet.")
