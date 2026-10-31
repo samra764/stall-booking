@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import io
@@ -23,13 +24,74 @@ from booking_parser import (EVENTS, PAYMENT_METHODS, normalize_contact, parse_da
 # ----------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="Stall Booking Records", page_icon="🧾", layout="wide")
+BASE = Path(__file__).parent
+try:
+    _icon = Image.open(BASE / "logo_prowess.png")
+except Exception:  # noqa
+    _icon = "🧾"
+st.set_page_config(page_title="Stall Booking", page_icon=_icon, layout="centered")
 
 BASE = Path(__file__).parent
 CRED_FILE = BASE / "credentials.json"      # downloaded from Google Cloud (see guide)
 CONFIG_FILE = BASE / "config.json"         # created automatically by the sidebar
 FILES_DIR = BASE / "booking_files"         # logos / receipts are always saved here too
 TZ = ZoneInfo("Asia/Karachi")
+
+# ----------------------------------------------------------------------------
+# Look and feel (purple / gold theme, built for phones)
+# ----------------------------------------------------------------------------
+EVENT_COLORS = {"Jacranda": "#B3267F", "AMBLEM": "#E8702A", "Qawali Night": "#1FA39A"}
+THEME_CSS = """
+.block-container{padding-top:4.2rem;padding-bottom:3rem;max-width:760px}
+.sbk-hdr{background:#fff;border-radius:18px;padding:12px 14px 10px;margin-bottom:12px;text-align:center}
+.sbk-logos{display:flex;align-items:center;justify-content:center;gap:16px}
+.sbk-logos img{height:84px;width:auto;max-width:48%}
+.sbk-sub{color:#B3267F;font-size:14px;font-weight:600;margin-top:6px;letter-spacing:.3px}
+.sbk-title{color:#3D1A5C;font-size:22px;font-weight:700}
+.sbk-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:6px 0 10px}
+@media(min-width:640px){.sbk-cards{grid-template-columns:repeat(4,1fr)}}
+.sbk-card{background:#fff;border-radius:12px;padding:10px 12px}
+.sbk-k{font-size:12px;color:#7A4A9C}
+.sbk-v{font-size:21px;font-weight:700;color:#3D1A5C;line-height:1.25}
+.sbk-card.sbk-pf{background:#B3267F}
+.sbk-card.sbk-pf .sbk-k{color:#FBE3F1}
+.sbk-card.sbk-pf .sbk-v{color:#fff}
+.sbk-evs{display:grid;grid-template-columns:1fr;gap:8px;margin-bottom:10px}
+@media(min-width:640px){.sbk-evs{grid-template-columns:repeat(3,1fr)}}
+.sbk-ev{background:#fff;border-radius:12px;padding:9px 12px}
+.sbk-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.sbk-tag{display:inline-block;color:#fff;font-size:12px;padding:2px 10px;border-radius:12px;white-space:nowrap}
+.sbk-n{font-size:13px;color:#3D1A5C;text-align:right}
+.sbk-bar{height:6px;border-radius:3px;background:#EFE3F7;margin-top:8px}
+.sbk-bar i{display:block;height:6px;border-radius:3px}
+.sbk-dia{display:flex;justify-content:center;gap:8px;margin:10px 0 6px}
+.sbk-dia i{width:9px;height:9px;transform:rotate(45deg);display:inline-block}
+button[data-baseweb="tab"]{padding:10px 9px}
+button[data-baseweb="tab"] p{font-size:14px}
+div[data-baseweb="tab-highlight"]{background-color:#F5C230 !important}
+button[data-testid="stBaseButton-primary"],button[data-testid="stBaseButton-primaryFormSubmit"],button[kind="primary"],button[kind="primaryFormSubmit"]{background-color:#F5C230 !important;border-color:#F5C230 !important;border-radius:24px;min-height:46px}
+button[data-testid="stBaseButton-primary"] p,button[data-testid="stBaseButton-primaryFormSubmit"] p,button[kind="primary"] p,button[kind="primaryFormSubmit"] p{color:#3D1A5C !important;font-weight:700}
+button[data-testid="stBaseButton-secondary"],button[data-testid="stBaseButton-secondaryFormSubmit"]{border-radius:24px;min-height:44px;border-color:#F5C230}
+input,textarea{font-size:16px !important}
+"""
+st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
+
+
+@st.cache_resource
+def _logo_uri(name):
+    p = BASE / name
+    return ("data:image/png;base64," + base64.b64encode(p.read_bytes()).decode()) if p.exists() else None
+
+
+def render_header():
+    a, b = _logo_uri("logo_prowess.png"), _logo_uri("logo_expo.png")
+    imgs = "".join(f'<img src="{u}" alt="{alt}"/>' for u, alt in ((a, "PROWESS"), (b, "Be Pakistani Buy Pakistani")) if u)
+    top = f'<div class="sbk-logos">{imgs}</div>' if imgs else '<div class="sbk-title">Be Pakistani, Buy Pakistani</div>'
+    st.markdown(f'<div class="sbk-hdr">{top}<div class="sbk-sub">Stall booking records</div></div>',
+                unsafe_allow_html=True)
+
+
+render_header()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
 
@@ -95,8 +157,17 @@ def receipt_text(rows):
     return "\n".join(out)
 
 
+def _logo_img(name, height):
+    try:
+        im = Image.open(BASE / name).convert("RGB")
+        return im.resize((round(im.width * height / im.height), height), Image.LANCZOS)
+    except Exception:  # noqa
+        return None
+
+
 def make_receipt_png(rows):
     W, M, LABEL_W, LH = 900, 50, 290, 40
+    PURPLE, GOLD = (61, 26, 92), (245, 194, 48)
     f_title, f_sub = _font(40, True), _font(24)
     f_label, f_val = _font(24), _font(28, True)
     laid, body_h = [], 0
@@ -106,24 +177,35 @@ def make_receipt_png(rows):
             wrapped += textwrap.wrap(str(ln), width=28) or [""]
         laid.append((label, wrapped))
         body_h += len(wrapped) * LH + 22
-    H = 190 + body_h + 110
+    HEAD, FOOT = 190, 150
+    H = HEAD + 30 + body_h + FOOT
     img = Image.new("RGB", (W, H), "white")
     d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, W, 150], fill=(31, 111, 74))
-    d.text((M, 32), "Booking Confirmation", font=f_title, fill="white")
-    d.text((M, 95), EXPO_TITLE, font=f_sub, fill=(220, 240, 228))
-    y = 190
+    d.rectangle([0, 0, W, HEAD], fill=PURPLE)
+    d.rectangle([0, HEAD, W, HEAD + 8], fill=GOLD)
+    d.text((M, 50), "Booking", font=f_title, fill="white")
+    d.text((M, 100), "Confirmation", font=f_title, fill=GOLD)
+    logo = _logo_img("logo_expo.png", 120)
+    if logo:
+        bw, bh = logo.width + 30, 150
+        x0 = W - M - bw
+        d.rounded_rectangle([x0, 20, x0 + bw, 20 + bh], radius=22, fill="white")
+        img.paste(logo, (x0 + 15, 20 + (bh - logo.height) // 2))
+    y = HEAD + 40
     for label, wrapped in laid:
-        d.text((M, y + 6), label, font=f_label, fill=(110, 110, 110))
+        d.text((M, y + 6), label, font=f_label, fill=(122, 74, 156))
         for i, ln in enumerate(wrapped):
-            d.text((M + LABEL_W, y + i * LH), ln, font=f_val, fill=(30, 30, 30))
+            d.text((M + LABEL_W, y + i * LH), ln, font=f_val, fill=PURPLE)
         y += len(wrapped) * LH + 22
-        d.line([M, y - 10, W - M, y - 10], fill=(228, 228, 228), width=2)
-    d.text((M, y + 20), "Please keep your booking ID for any future contact.", font=f_sub, fill=(90, 90, 90))
+        d.line([M, y - 10, W - M, y - 10], fill=(236, 226, 244), width=2)
+    d.text((M, y + 24), "Please keep your booking ID", font=f_sub, fill=(90, 60, 120))
+    d.text((M, y + 54), "for any future contact.", font=f_sub, fill=(90, 60, 120))
+    plogo = _logo_img("logo_prowess.png", 100)
+    if plogo:
+        img.paste(plogo, (W - M - plogo.width, y + 10))
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
-
 
 
 def secrets_get(key, default=None):
@@ -529,7 +611,7 @@ if st.session_state.pop("do_reset_now", False):
 # ----------------------------------------------------------------------------
 _pw = secrets_get("app_password")
 if _pw and not st.session_state.get("authed"):
-    st.title("🔒 Stall Booking Records")
+    st.subheader("🔒 Enter the password")
     entered = st.text_input("Password", type="password")
     if entered:
         if hmac.compare_digest(entered.encode(), str(_pw).encode()):
@@ -599,9 +681,9 @@ st.sidebar.success(f"Connected: {sh.title}")
 # ----------------------------------------------------------------------------
 # Main UI
 # ----------------------------------------------------------------------------
-st.title("🧾 Stall Booking Records")
+dash = st.container()          # filled in at the very end, once all the helper functions exist
 tab_new, tab_view, tab_search, tab_exp, tab_edit = st.tabs(
-    ["➕ New booking", "📊 Records", "🔎 Search", "💸 Expenses", "✏️ Edit booking"])
+    ["➕ New booking", "📊 Records", "🔎 Search", "💸 Expenses", "✏️ Edit"])
 
 with tab_new:
     st.subheader("Step 1 - Paste the booking details")
@@ -990,12 +1072,6 @@ with tab_exp:
             st.rerun()
         vals = read_all(expenses_ws, EXPENSE_TITLE)
         data = [r + [""] * (len(EXPENSE_HEADERS) - len(r)) for r in vals[1:]]
-        spent = sum(_amount(r[3]) for r in data)
-        collected = total_collected()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Collected from stalls", rs(collected))
-        c2.metric("Total expenses", rs(spent))
-        c3.metric("Profit so far", rs(collected - spent))
         if data:
             by_person = {}
             for r in data:
@@ -1369,3 +1445,46 @@ with tab_edit:
                 st.dataframe(pd.DataFrame(ld, columns=LOG_HEADERS).iloc[::-1].head(40), hide_index=True)
             else:
                 st.caption("No changes recorded yet.")
+
+
+# ----------------------------------------------------------------------------
+# Home-page summary (shown above the tabs)
+# ----------------------------------------------------------------------------
+def render_dashboard():
+    rows = load_all_rows()
+    stalls = {stall_key(d) for d in rows if stall_key(d)}
+    per = {ev: [0, 0.0] for ev in EVENTS}
+    for d in rows:
+        if d["_event"] in per:
+            per[d["_event"]][0] += 1
+            per[d["_event"]][1] += _amount(d.get("Paid Amount (This Event)", ""))
+    collected = sum(v[1] for v in per.values())
+    spent = 0.0
+    if expenses_ws is not None:
+        ev = read_all(expenses_ws, EXPENSE_TITLE)
+        spent = sum(_amount(r[3]) for r in ev[1:] if len(r) > 3)
+    profit = collected - spent
+    cards = [("Stalls booked", str(len(stalls)), ""), ("Collected", rs(collected), ""),
+             ("Expenses", rs(spent), ""), ("Profit so far", rs(profit), " sbk-pf")]
+    html = '<div class="sbk-cards">' + "".join(
+        f'<div class="sbk-card{c}"><div class="sbk-k">{k}</div><div class="sbk-v">{v}</div></div>'
+        for k, v, c in cards) + "</div>"
+    html += '<div class="sbk-evs">'
+    for ev_name in EVENTS:
+        n, amt = per[ev_name]
+        pct = round(100 * amt / collected) if collected > 0 else 0
+        color = EVENT_COLORS.get(ev_name, "#B3267F")
+        html += (f'<div class="sbk-ev"><div class="sbk-row"><span class="sbk-tag" style="background:{color}">{ev_name}</span>'
+                 f'<span class="sbk-n">{n} stall{"s" if n != 1 else ""} · {rs(amt)}</span></div>'
+                 f'<div class="sbk-bar"><i style="width:{pct}%;background:{color}"></i></div></div>')
+    html += "</div>"
+    html += '<div class="sbk-dia">' + "".join(
+        f'<i style="background:{c}"></i>' for c in ["#B3267F", "#F5C230", "#1FA39A", "#E8702A"] * 2) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+with dash:
+    try:
+        render_dashboard()
+    except Exception as e:  # noqa - the summary is a bonus, never block the app
+        print(f"Dashboard could not be drawn: {e}")
