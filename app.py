@@ -40,7 +40,7 @@ TZ = ZoneInfo("Asia/Karachi")
 # ----------------------------------------------------------------------------
 # Look and feel (purple / gold theme, built for phones)
 # ----------------------------------------------------------------------------
-EVENT_COLORS = {"Jacranda": "#B3267F", "AMBLEM": "#E8702A", "Qawali Night": "#1FA39A"}
+EVENT_COLORS = {"Jacranda": "#B3267F", "AMBLEM": "#E8702A", "Qawali Night": "#1FA39A", "ARID University": "#4C7BD9"}
 THEME_CSS = """
 .block-container{padding-top:4.2rem;padding-bottom:3rem;max-width:760px}
 .sbk-hdr{background:#fff;border-radius:18px;padding:12px 14px 10px;margin-bottom:12px;text-align:center}
@@ -57,7 +57,7 @@ THEME_CSS = """
 .sbk-card.sbk-pf .sbk-k{color:#FBE3F1}
 .sbk-card.sbk-pf .sbk-v{color:#fff}
 .sbk-evs{display:grid;grid-template-columns:1fr;gap:8px;margin-bottom:10px}
-@media(min-width:640px){.sbk-evs{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:640px){.sbk-evs{grid-template-columns:repeat(2,1fr)}}
 .sbk-ev{background:#fff;border-radius:12px;padding:9px 12px}
 .sbk-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .sbk-tag{display:inline-block;color:#fff;font-size:12px;padding:2px 10px;border-radius:12px;white-space:nowrap}
@@ -101,7 +101,7 @@ HEADERS = ["Booking ID", "Saved At", "Name", "Brand Name", "Brand Items",
            "Contact", "Logo", "Payment Receipt", "Payment Method", "Received By",
            "Other IDs of This Booking"]
 LAST_COL = "P"      # 16 columns: A..P
-EVENT_CODES = {"Jacranda": "JAC", "AMBLEM": "AMB", "Qawali Night": "QWL"}
+EVENT_CODES = {"Jacranda": "JAC", "AMBLEM": "AMB", "Qawali Night": "QWL", "ARID University": "ARD"}
 COL_BRAND, COL_CONTACT = HEADERS.index("Brand Name"), HEADERS.index("Contact")   # 0-based
 
 
@@ -338,7 +338,7 @@ def fix_heading_case(ws, first, canonical):
         ws.update(range_name=f"A1:{chr(64 + len(canon))}1", values=[canon])
         return canon
     return first
-SCHEMA_VERSION = "2026-10-28-edit-log"   # bump when the sheet layout changes
+SCHEMA_VERSION = "2026-11-14-arid-university"   # bump when the sheet layout changes
 EXPENSE_HEADERS = ["Expense ID", "Date", "What it was for", "Amount (Rs)", "Taken By", "Receipt Photo"]
 
 
@@ -410,77 +410,79 @@ def next_expense_id(ws, log_ws=None):
     return f"EXP-{top + 1:03d}"
 
 
-def write_profit_block(ws):
-    """Adds the 'Profit' lines to the Summary tab (rows 19-22), only if that spot is empty."""
-    try:
-        cur = ws.get_values("A19:B22")
-        if any(any(str(c).strip() for c in r) for r in cur):
-            return
-        amount_col = chr(ord("A") + EXPENSE_HEADERS.index("Amount (Rs)"))
-        rows = [["Profit", "Amount (Rs)"],
-                ["Total collected from stalls", "=C8"],
-                ["Total expenses", f"=SUM('{EXPENSE_TITLE}'!{amount_col}2:{amount_col})"],
-                ["PROFIT (collected - expenses)", "=B20-B21"]]
-        ws.update(range_name="A19", values=rows, value_input_option="USER_ENTERED")
-        try:
-            green = {"backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}}
-            ws.format("A19:B19", {"textFormat": {"bold": True}, **green})
-            ws.format("B20:B22", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
-            ws.format("A22:B22", {"textFormat": {"bold": True}})
-        except Exception as e:  # noqa
-            print(f"Profit block formatting skipped: {e}")
-    except Exception as e:  # noqa
-        print(f"Profit block could not be written: {e}")
-
-
 def ensure_summary_sheet(sh):
-    """Creates a 'Summary' tab (first tab) with live formulas over the three event tabs.
-    Created once; if it already exists it is left alone so your own edits are never overwritten."""
+    """The 'Summary' tab: live formulas over all event tabs, plus the expenses and profit lines.
+    If the app made an older version of it (for example before an event was added), the tab is
+    rebuilt. A Summary tab that you made yourself (different title cell) is never touched."""
+    n = len(EVENTS)
+    marker = f"(layout: {n} events)"
     existing = {w.title: w for w in sh.worksheets()}
-    if SUMMARY_TITLE in existing:             # already there: only add the new Profit lines if missing
-        write_profit_block(existing[SUMMARY_TITLE])
-        return
+    if SUMMARY_TITLE in existing:
+        try:
+            top = existing[SUMMARY_TITLE].get_values("A1:A2")
+        except Exception:  # noqa
+            top = []
+        a1 = top[0][0] if top and top[0] else ""
+        a2 = top[1][0] if len(top) > 1 and top[1] else ""
+        if a1 != "Stall Booking Summary" or marker in a2:
+            return                                        # not ours, or already up to date
+        sh.del_worksheet(existing[SUMMARY_TITLE])         # ours but an older layout: rebuild it
     col = lambda name: chr(ord("A") + HEADERS.index(name))        # column letter of a heading
     paid, contact, method = col("Paid Amount (This Event)"), col("Contact"), col("Payment Method")
     ids = col("Booking ID")
+    amount_col = chr(ord("A") + EXPENSE_HEADERS.index("Amount (Rs)"))
     q = lambda ev: f"'{ev}'"
-    rows = [["Stall Booking Summary", "", "", "", ""],
-            ["Updates automatically from the three event tabs. Do not type inside the tables.", "", "", "", ""],
-            ["", "", "", "", ""],
-            ["Event", "Stall bookings", "Payment collected (Rs)", "", ""]]
-    for i, ev in enumerate(EVENTS):
-        rows.append([ev, f"=COUNTA({q(ev)}!{ids}2:{ids})", f"=SUM({q(ev)}!{paid}2:{paid})", "", ""])
-    first, last = 5, 4 + len(EVENTS)
-    rows.append(["TOTAL", f"=SUM(B{first}:B{last})", f"=SUM(C{first}:C{last})", "", ""])
+    width = n + 2
+    pad = lambda row: list(row) + [""] * (width - len(row))
+    last_ev_col, total_col = chr(ord("A") + n), chr(ord("A") + n + 1)
+    rows = [pad(["Stall Booking Summary"]),
+            pad([f"Updates automatically from the event tabs. Do not type inside the tables. {marker}"]),
+            pad([]),
+            pad(["Event", "Stall bookings", "Payment collected (Rs)"])]
+    for ev in EVENTS:
+        rows.append(pad([ev, f"=COUNTA({q(ev)}!{ids}2:{ids})", f"=SUM({q(ev)}!{paid}2:{paid})"]))
+    first, last = 5, 4 + n
+    total_row = last + 1
+    rows.append(pad(["TOTAL", f"=SUM(B{first}:B{last})", f"=SUM(C{first}:C{last})"]))
+    rows.append(pad([]))
     stack = ";".join(f"{q(ev)}!{contact}2:{contact}" for ev in EVENTS)
-    rows.append(["", "", "", "", ""])
-    rows.append(["Unique stalls (a stall booked for several events counts once)",
-                 f'=IFERROR(ROWS(UNIQUE(FILTER({{{stack}}},{{{stack}}}<>""))),0)', "", "", ""])
+    rows.append(pad(["Unique stalls (a stall booked for several events counts once)",
+                     f'=IFERROR(ROWS(UNIQUE(FILTER({{{stack}}},{{{stack}}}<>""))),0)']))
     unpaid = "+".join(f'COUNTIF({q(ev)}!{method}2:{method},"No payment yet")' for ev in EVENTS)
-    rows.append(["Bookings with no payment yet", f"={unpaid}", "", "", ""])
-    rows.append(["", "", "", "", ""])
-    rows.append(["Payment collected by method (Rs)"] + EVENTS + ["Total"])
-    start = len(rows) + 1
+    rows.append(pad(["Bookings with no payment yet", f"={unpaid}"]))
+    rows.append(pad([]))
+    rows.append(pad(["Payment collected by method (Rs)"] + EVENTS + ["Total"]))
+    hdr = len(rows)
+    start = hdr + 1
     for i, m in enumerate(PAYMENT_METHODS[:-1]):                   # all methods except 'No payment yet'
         r = start + i
-        rows.append([m] + [f"=SUMIF({q(ev)}!{method}2:{method},$A{r},{q(ev)}!{paid}2:{paid})"
-                           for ev in EVENTS] + [f"=SUM(B{r}:D{r})"])
-    ws = sh.add_worksheet(title=SUMMARY_TITLE, rows=40, cols=6, index=0)
+        rows.append(pad([m] + [f"=SUMIF({q(ev)}!{method}2:{method},$A{r},{q(ev)}!{paid}2:{paid})"
+                               for ev in EVENTS] + [f"=SUM(B{r}:{last_ev_col}{r})"]))
+    end = len(rows)
+    rows.append(pad([]))
+    prof = len(rows) + 1
+    rows.append(pad(["Profit", "Amount (Rs)"]))
+    rows.append(pad(["Total collected from stalls", f"=C{total_row}"]))
+    rows.append(pad(["Total expenses", f"=SUM('{EXPENSE_TITLE}'!{amount_col}2:{amount_col})"]))
+    rows.append(pad(["PROFIT (collected - expenses)", f"=B{prof + 1}-B{prof + 2}"]))
+    ws = sh.add_worksheet(title=SUMMARY_TITLE, rows=max(40, len(rows) + 5), cols=width, index=0)
     ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")
     try:                                   # looks only; the numbers are already in place
         bold = {"textFormat": {"bold": True}}
+        green = {"backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}}
+        num = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
         ws.format("A1", {"textFormat": {"bold": True, "fontSize": 16}})
-        ws.format("A4:C4", {**bold, "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}})
-        ws.format(f"A{last + 1}:C{last + 1}", bold)
-        hdr = start - 1
-        ws.format(f"A{hdr}:E{hdr}", {**bold, "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.85}})
-        ws.format("C5:C8", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
-        ws.format(f"B{start}:E{start + len(PAYMENT_METHODS) - 2}",
-                  {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
-        ws.columns_auto_resize(0, 4)
+        ws.format("A4:C4", {**bold, **green})
+        ws.format(f"A{total_row}:C{total_row}", bold)
+        ws.format(f"C5:C{total_row}", num)
+        ws.format(f"A{hdr}:{total_col}{hdr}", {**bold, **green})
+        ws.format(f"B{start}:{total_col}{end}", num)
+        ws.format(f"A{prof}:B{prof}", {**bold, **green})
+        ws.format(f"B{prof + 1}:B{prof + 3}", num)
+        ws.format(f"A{prof + 3}:B{prof + 3}", bold)
+        ws.columns_auto_resize(0, width)
     except Exception as e:  # noqa
         print(f"Summary formatting skipped: {e}")
-    write_profit_block(ws)
 
 
 def find_duplicates(sheets, events, brand, contact):
@@ -936,7 +938,7 @@ with tab_search:
         st.rerun()
     if not q.strip():
         st.caption("Type part of a brand or person name, a phone number, or an ID such as JAC-014 "
-                   "(or just 14). All three events are searched together.")
+                   "(or just 14). All events are searched together.")
     else:
         all_rows = load_all_rows()
         groups = {}

@@ -5,7 +5,7 @@ from difflib import get_close_matches
 
 from dateutil import parser as dateparser
 
-EVENTS = ["Jacranda", "AMBLEM", "Qawali Night"]
+EVENTS = ["Jacranda", "AMBLEM", "Qawali Night", "ARID University"]
 
 # Every spelling we accept -> the one official event name (= the sheet/tab name)
 EVENT_ALIASES = {
@@ -15,6 +15,8 @@ EVENT_ALIASES = {
     "qawali night": "Qawali Night", "qawwali night": "Qawali Night",
     "qawali": "Qawali Night", "qawwali": "Qawali Night", "kawali night": "Qawali Night",
     "qawali nite": "Qawali Night", "qawalli night": "Qawali Night",
+    "arid university": "ARID University", "arid": "ARID University", "arid uni": "ARID University",
+    "arid universty": "ARID University", "aridu": "ARID University", "arid university rawalpindi": "ARID University",
 }
 
 # label written by the user (lower-case, no % sign) -> internal field
